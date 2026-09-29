@@ -5,15 +5,20 @@ declare(strict_types=1);
 namespace PhpSoftBox\View;
 
 use RuntimeException;
+use Throwable;
 
 use function array_merge;
 use function extract;
 use function is_file;
 use function is_string;
 use function ltrim;
+use function ob_end_clean;
+use function ob_end_flush;
 use function ob_get_clean;
+use function ob_get_level;
 use function ob_start;
 use function rtrim;
+use function sprintf;
 use function str_starts_with;
 
 use const DIRECTORY_SEPARATOR;
@@ -21,6 +26,11 @@ use const EXTR_SKIP;
 
 final readonly class PhpViewRenderer implements ViewRendererInterface, TemplateExistsInterface
 {
+    /**
+     * Максимальная глубина вложенности layouts (защита от циклического setLayout()).
+     */
+    private const int MAX_LAYOUT_DEPTH = 10;
+
     /**
      * @param array<string, mixed> $sharedData
      */
@@ -54,16 +64,41 @@ final readonly class PhpViewRenderer implements ViewRendererInterface, TemplateE
      */
     public function renderWithContext(string $template, array|ViewDataInterface $data, ViewContext $context): string
     {
-        $content = $this->partialRenderWithContext($template, $data, $context);
+        // Layout принадлежит конкретному вызову render(): вложенный render() из шаблона не должен
+        // наследовать layout внешнего шаблона и не должен его затирать.
+        $outerLayoutTemplate = $context->layoutTemplate();
+        $outerLayoutData     = $context->layoutData();
+        $context->clearLayout();
 
-        $layoutTemplate = $context->layoutTemplate();
-        if (!is_string($layoutTemplate) || $layoutTemplate === '') {
+        try {
+            $content = $this->partialRenderWithContext($template, $data, $context);
+
+            // Вложенные layouts: layout сам может вызвать setLayout() и обернуться в родительский layout.
+            $depth = 0;
+            while (is_string($layoutTemplate = $context->layoutTemplate()) && $layoutTemplate !== '') {
+                if (++$depth > self::MAX_LAYOUT_DEPTH) {
+                    throw new RuntimeException(sprintf(
+                        'Layout nesting depth exceeded %d (circular layout?) for template: %s',
+                        self::MAX_LAYOUT_DEPTH,
+                        $template,
+                    ));
+                }
+
+                $layoutData = $context->layoutData();
+                $context->clearLayout();
+
+                $layoutPayload = $this->prepareLayoutPayload($layoutData, $content, $context);
+                $content       = $this->partialRenderWithContext($layoutTemplate, $layoutPayload, $context);
+            }
+
             return $content;
+        } finally {
+            if (is_string($outerLayoutTemplate)) {
+                $context->setLayout($outerLayoutTemplate, $outerLayoutData);
+            } else {
+                $context->clearLayout();
+            }
         }
-
-        $layoutPayload = $this->prepareLayoutPayload($context->layoutData(), $content, $context);
-
-        return $this->partialRenderWithContext($layoutTemplate, $layoutPayload, $context);
     }
 
     /**
@@ -77,11 +112,28 @@ final readonly class PhpViewRenderer implements ViewRendererInterface, TemplateE
             throw new RuntimeException('View file not found: ' . $path);
         }
 
+        $level = ob_get_level();
         ob_start();
-        if ($data instanceof ViewDataInterface) {
-            $this->renderObjectPayload($path, $data, $context);
-        } else {
-            $this->renderArrayPayload($path, $data, $context);
+
+        try {
+            if ($data instanceof ViewDataInterface) {
+                $this->renderObjectPayload($path, $data, $context);
+            } else {
+                $this->renderArrayPayload($path, $data, $context);
+            }
+        } catch (Throwable $exception) {
+            // Исключение в шаблоне: выбрасываем частичный HTML и все буферы, открытые шаблоном,
+            // чтобы уровни буферизации не накапливались в долгоживущем worker.
+            while (ob_get_level() > $level) {
+                ob_end_clean();
+            }
+
+            throw $exception;
+        }
+
+        // Буферы, которые шаблон открыл и не закрыл, сливаем в наш буфер.
+        while (ob_get_level() > $level + 1) {
+            ob_end_flush();
         }
 
         return (string) ob_get_clean();

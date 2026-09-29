@@ -11,6 +11,8 @@
 - [Quick Start](#quick-start)
 - [Payload Types](#payload-types)
 - [render()](#render)
+- [Layouts](#layouts)
+- [Ошибки в шаблонах](#ошибки-в-шаблонах)
 - [partialRender()](#partialrender)
 - [renderWithContext()](#renderwithcontext)
 - [partialRenderWithContext()](#partialrenderwithcontext)
@@ -125,6 +127,49 @@ echo $renderer->render('user/card.phtml', $view);
 ?>
 <div><?= html($this->name) ?> (<?= html($this->email) ?>)</div>
 ```
+
+## Layouts
+
+Layout задаётся шаблоном через `$viewContext->setLayout()` и относится **только к текущему вызову**
+`render()` / `renderWithContext()`:
+
+- перед рендером шаблона layout в контексте сбрасывается, после рендера восстанавливается прежнее
+  состояние. Поэтому вложенный `$viewContext->render()` из шаблона не наследует layout внешнего шаблона,
+  а layout вложенного шаблона не применяется к внешнему;
+- layout, установленный в `ViewContext` снаружи до вызова `renderWithContext()`, не применяется —
+  его должен задавать сам шаблон;
+- `partialRender()` / `partialRenderWithContext()` layout не применяют: вызов `setLayout()` внутри
+  partial-шаблона влияет на ближайший внешний `render()`.
+
+### Вложенные layouts
+
+Layout может сам вызвать `setLayout()` — тогда его результат оборачивается в родительский layout
+(и так далее по цепочке). Глубина вложенности ограничена 10 уровнями: циклическая ссылка
+(layout указывает сам на себя) приводит к `RuntimeException`.
+
+`page.phtml`:
+
+```php
+<?php $viewContext->setLayout('layouts/admin.phtml', ['title' => 'Users']); ?>
+<table>...</table>
+```
+
+`layouts/admin.phtml`:
+
+```php
+<?php $viewContext->setLayout('layouts/app.phtml', ['title' => $title]); ?>
+<nav>...</nav>
+<section><?= raw($content) ?></section>
+```
+
+Результат: `layouts/app.phtml` с `$content` = вывод `layouts/admin.phtml`, внутри которого вывод `page.phtml`.
+
+## Ошибки в шаблонах
+
+Если шаблон выбрасывает исключение, renderer удаляет частичный вывод и все буферы вывода, открытые
+шаблоном, после чего пробрасывает исключение дальше. Уровень `ob_get_level()` возвращается к исходному,
+поэтому в долгоживущих worker'ах буферы не накапливаются. Буферы, которые шаблон открыл и не закрыл
+при успешном рендере, сливаются в результат рендера.
 
 ## partialRender()
 
